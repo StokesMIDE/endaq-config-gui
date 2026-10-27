@@ -424,7 +424,7 @@ class BrokerConnectThread(threading.Thread):
 
 
     def run(self):
-        wx.PostEvent(self.parent, EvtMQTTConnecting(info=self.info))
+        self.postEvent(EvtMQTTConnecting(info=self.info))
         onConnect = partial(postCallbackEvent, EvtMQTTConnected, self.root)
         onDisconnect = partial(postCallbackEvent, EvtMQTTDisconnected, self.root)
 
@@ -454,8 +454,7 @@ class BrokerConnectThread(threading.Thread):
         # Connected to the broker; check the `MQTTDeviceManager`
         try:
             con.command.ping()
-            wx.PostEvent(self.parent, EvtBrokerSelected(connector=con,
-                                                        info=self.info))
+            self.postEvent(EvtBrokerSelected(connector=con, info=self.info))
 
         except (CommunicationError, TimeoutError) as err:
             self.postError("Could not contact enDAQ Device Manager", err)
@@ -470,17 +469,25 @@ class BrokerConnectThread(threading.Thread):
             self.postError(str(err), err)
 
 
-    def postError(self, message: str, err: Exception):
-        """ Post an `EVT_MQTT_ERROR` event.
+    def postEvent(self, evt: wx.Event):
+        """ Post an event to the parent, if it still exists (the parent
+            dialog may be closed while the thread runs).
         """
+        if not self.parent:
+            logger.debug(f'Parent gone, not posting {type(evt).__name__}')
+            return
         try:
-            wx.PostEvent(self.parent,
-                         EvtMQTTError(message=message, exception=err))
+            wx.PostEvent(self.parent, evt)
         except RuntimeError as e:
             # Possibly called while changing windows or cleaning up,
             # which is (probably) okay.
-            logger.debug(f'Ignoring failure posting  to {self.parent}: {e}')
-            pass
+            logger.debug(f'Ignoring failure posting to {self.parent}: {e}')
+
+
+    def postError(self, message: str, err: Exception):
+        """ Post an `EVT_MQTT_ERROR` event.
+        """
+        self.postEvent(EvtMQTTError(message=message, exception=err))
 
 
 def postCallbackEvent(eventType: type[wx.Event],
