@@ -368,11 +368,6 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
             btn.Bind(wx.EVT_BUTTON, handler)
             return btn
 
-        self.selectAllBtn = wx.BitmapButton(buttonpane, -1, icons.select_all.GetBitmap())
-        self.selectAllBtn.SetToolTip('Check All')
-        self.selectNoneBtn = wx.BitmapButton(buttonpane, -1, icons.select_none.GetBitmap())
-        self.selectNoneBtn.SetToolTip('Check None')
-
         self.multiStartBtn = _add('Start Checked', startIcons,
                                   "Send the start recording command to all checked devices",
                                   self.OnStartSelected)
@@ -389,19 +384,6 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
                                                  initialValue=defaultPath,
                                                  changeCallback=self.OnSavePathPicked)
         self.savePathField.SetSizerProps(valign='center', expand=True, proportion=1)
-
-        # Note: setting the width of the all/none buttons wasn't taking for some reason.
-        #  The `SetBitmapMargins` fixes it, but may have cosmetic issues on different
-        #  platforms and/or screen resolutions.
-        h = self.multiStreamBtn.GetSize().height
-        size = wx.Size(h, h)
-        self.selectAllBtn.SetSize(size)
-        self.selectAllBtn.SetBitmapMargins((4, 2))
-        self.selectNoneBtn.SetSize(size)
-        self.selectNoneBtn.SetBitmapMargins((4, 2))
-
-        self.Bind(wx.EVT_BUTTON, self.OnSelectAllButton, self.selectAllBtn)
-        self.Bind(wx.EVT_BUTTON, self.OnSelectNoneButton, self.selectNoneBtn)
 
 
     # TODO: REMOVE NEXT LINE LATER (linter doesn't like monkeypatched sizer methods, clutters everything up)
@@ -489,6 +471,7 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
 
         if self.checks:
             self.Bind(ULC.EVT_LIST_ITEM_CHECKED, self.OnItemChecked, self.list)
+            self.Bind(ULC.EVT_LIST_COL_CHECKED, self.OnHeaderChecked, self.list)
 
         # For doing per-item tool tips in the list
         self.lastToolTipItem = -1
@@ -658,8 +641,16 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
 
         for i, c in enumerate(cols, start):
             self.list.InsertColumn(i, c[0])
+            if i == 0 and self.checks:
+                # Header checkbox, for checking/unchecking all rows
+                header = self.list.GetColumn(i)
+                header.SetKind(1)
+                header.Check(False)
+                self.list.SetColumn(i, header)
+
             if c.name == 'Path' and self.checks:
-                width = 50
+                # Room for the header checkbox and the column name
+                width = self.list.GetTextExtent(c.name)[0] + 24
             elif c.name == 'Name':
                 width = self.list.GetTextExtent('W' * 20)[0]
             elif c.formatter == populateStatusColumn:
@@ -681,13 +672,9 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
             logger.debug('populating list')
             self.SetCursor(wx.Cursor(wx.CURSOR_WAIT))
 
-            # Get checked devices (may have different list indices)
-            checked = self.checkedRecorders.copy()
-
             self.list.ClearAll()
             self.recordersByIndex.clear()
             self.indicesByRecorder.clear()
-            self.checkedRecorders.clear()
             self.itemDataMap.clear()
             self.listWidth = 0
 
@@ -702,10 +689,6 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
                 index = self.list.InsertImageStringItem(idx, path, [0], int(self.checks))
                 self.list.EnableItem(index, enable=isOnline(dev))
                 # print(f'{dev} {dev.command.status} {isOnline(dev)=} {isSleeping(dev)=}')
-
-                # update dict of checked recorders with new list indices
-                if dev in checked:
-                    self.checkedRecorders.add(dev)
 
                 self.itemDataMap[index] = [dev.path]
                 self.recordersByIndex[index] = dev
@@ -741,6 +724,12 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
 
             if not self.recordersByIndex or not self.selected:
                 self.OnItemDeselected(None)
+
+            # Forget checked devices no longer in the list. Done here rather
+            # than rebuilding the set, so checks made while this runs
+            # (e.g., during a `wx.Yield()`) aren't lost.
+            self.checkedRecorders.intersection_update(self.recordersByIndex.values())
+            self.updateChecks()
 
         finally:
             self.SetCursor(wx.Cursor(wx.CURSOR_DEFAULT))
@@ -831,10 +820,51 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
                 # Possible error in row population, or race condition
                 logger.debug(f'IndexError updating row for device {dev.serial}')
 
+        self.updateChecks()
+
+
+    def updateChecks(self):
+        """ Apply `checkedRecorders` to the rows' checkboxes, and update the
+            controls that depend on them. Unlike `updateList()`, this is
+            quick and never skipped, so it is safe to call while an update
+            is in progress (e.g., from an event handled during `wx.Yield()`).
+        """
+        if not self.checks:
+            return
+
+        for idx, dev in self.recordersByIndex.items():
+            item = self.list.GetItem(idx)
+            checked = dev in self.checkedRecorders
+            if item.IsChecked() != checked:
+                item.Check(checked)
+                self.list.SetItem(item)
+
         checked = self.list.GetCheckedItemCount() > 0
         self.multiStreamBtn.Enable(checked)
         self.multiStartBtn.Enable(checked)
         self.multiStopBtn.Enable(checked)
+        self.updateHeaderCheck()
+
+
+    def allEnabledChecked(self) -> bool:
+        """ Are all enabled rows checked? `False` if no rows are enabled.
+        """
+        enabled = [dev for idx, dev in self.recordersByIndex.items()
+                   if self.list.IsItemEnabled(idx)]
+        return bool(enabled) and all(dev in self.checkedRecorders for dev in enabled)
+
+
+    def updateHeaderCheck(self):
+        """ Show the first column's header checkbox as checked if all
+            enabled rows are checked.
+        """
+        if not self.checks or not self.list.GetColumnCount():
+            return
+        checked = self.allEnabledChecked()
+        header = self.list.GetColumn(0)
+        if header.IsChecked() != checked:
+            header.Check(checked)
+            self.list.SetColumn(0, header)
 
 
     def getSelected(self) -> Optional[Recorder]:
@@ -1683,7 +1713,7 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
                 self.checkedRecorders.remove(dev)
             except KeyError:
                 pass
-        self.updateList()
+        self.updateChecks()
         evt.Skip()
 
 
@@ -1695,19 +1725,20 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
         # self.saveCheck.SetValue(True)
 
 
-    def OnSelectAllButton(self, _evt):
-        logger.debug('Check all')
-        self.checkedRecorders.clear()
-        for idx, dev in self.recordersByIndex.items():
-            if self.list.IsItemEnabled(idx):
-                self.checkedRecorders.add(dev)
-        self.updateList()
-
-
-    def OnSelectNoneButton(self, _evt):
-        logger.debug('Check none')
-        self.checkedRecorders.clear()
-        self.updateList()
+    def OnHeaderChecked(self, _evt):
+        """ Handle the first column's header checkbox being clicked. If all
+            enabled rows are checked, uncheck everything; otherwise, check
+            all enabled rows.
+        """
+        if self.allEnabledChecked():
+            logger.debug('Check none')
+            self.checkedRecorders.clear()
+        else:
+            logger.debug('Check all')
+            for idx, dev in self.recordersByIndex.items():
+                if self.list.IsItemEnabled(idx):
+                    self.checkedRecorders.add(dev)
+        self.updateChecks()
 
 
     # =======================================================================
