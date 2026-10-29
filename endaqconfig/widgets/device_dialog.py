@@ -21,7 +21,7 @@ import wx.lib.mixins.listctrl as listmix
 from wx.lib.agw import ultimatelistctrl as ULC
 import wx.lib.filebrowsebutton as FBB
 
-from endaq.device import (Recorder, RECORDERS, UnsupportedFeature,
+from endaq.device import (Recorder, RECORDERS, RECORDERS_BY_SN, UnsupportedFeature,
                           CommandError, DeviceError, deviceChanged,
                           DeviceStatusCode, _module_busy)
 from endaq.device.base import os_specific
@@ -907,6 +907,9 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
                                        debug=self.DEBUG)
             self.SetCursor(wx.Cursor(wx.CURSOR_DEFAULT))
             if result:
+                # Configuration was applied (`result` is `None` if cancelled).
+                # Discard the instance; discovery will create a new one.
+                self.forgetDevice(recorder)
                 msg = result[-1]
                 if msg:
                     showPostConfigMessage(self, msg)
@@ -916,6 +919,44 @@ class DeviceSelectionDialog(sc.SizedFrame, listmix.ColumnSorterMixin):
                 self.SetCursor(wx.Cursor(wx.CURSOR_DEFAULT))
                 self.startUpdater()
                 wx.CallAfter(self.OnUpdateTimerTick)
+
+
+    def forgetDevice(self, recorder: Recorder):
+        """ Delete a `Recorder` instance and its cached data, so the next
+            scan creates a new instance of the device. Note: removal is by
+            identity; a new instance of a device compares equal to the old.
+        """
+        logger.debug(f'Forgetting {recorder}')
+
+        with _module_busy:
+            # Each instance appears once per cache. `RECORDERS` keys vary
+            # (DEVINFO or path hash), so find it by value.
+            key = next((k for k, v in RECORDERS.items() if v is recorder), None)
+            if key is not None:
+                del RECORDERS[key]
+            if RECORDERS_BY_SN.get(recorder.serialInt) is recorder:
+                del RECORDERS_BY_SN[recorder.serialInt]
+
+        if self.scanThread:
+            self.scanThread.forgetDevice(recorder)
+
+        self.recorders = [dev for dev in self.recorders if dev is not recorder]
+        self.recorderStatus.pop(recorder, None)
+        self.recorderTimeouts.pop(recorder, None)
+        self.checkedRecorders.discard(recorder)
+        if self.recordersByIndex.get(self.selected) is recorder:
+            self.selected = None
+
+        # Release the port (serial ports can only be opened once). Use the
+        # attribute; the `command` property may create a new interface.
+        command = getattr(recorder, '_command', None)
+        if command is not None:
+            try:
+                command.close()
+            except Exception as err:
+                logger.debug(f'Ignoring error closing {recorder} command interface: {err!r}')
+
+        wx.CallAfter(self.populateList)
 
 
     def enableButtons(self, enabled=True):
